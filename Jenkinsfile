@@ -30,13 +30,13 @@ pipeline {
             steps {
                 checkout scm
                 script {
-                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${sh(
+                    def gitSha = sh(
                         returnStdout: true,
                         script: 'git rev-parse --short=7 HEAD'
-                    ).trim()}"
-                }
-                echo "Image tag for this build: ${IMAGE_TAG}"
-            }
+                    ).trim()
+
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${gitSha}"
+                } 
         }
 
         stage('Backend Tests and Lint') {
