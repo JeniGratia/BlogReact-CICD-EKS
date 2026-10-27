@@ -9,10 +9,11 @@ pipeline {
     }
 
     environment {
-        APP_NAMESPACE = 'blogapp'
-        BACKEND_IMAGE = 'blogreact-backend:local'
+        APP_NAMESPACE  = 'blogapp'
+        BACKEND_IMAGE  = 'blogreact-backend:local'
         FRONTEND_IMAGE = 'blogreact-frontend:local'
-        NODE_IMAGE = 'node:20-alpine'
+        NODE_IMAGE     = 'node:20-alpine'
+        KIND_NODE      = 'blog-project-control-plane'
     }
 
     stages {
@@ -27,10 +28,8 @@ pipeline {
                 dir('backend') {
                     sh '''
                         set -eu
-                        ls -la   # debug: confirm package.json exists in the workspace
-
                         cid=$(docker create -w /app "$NODE_IMAGE" sh -ec \
-                          "npm install --no-package-lock --no-audit --no-fund && npm test && npm run lint")
+                          "npm ci --no-audit --no-fund && npm test && npm run lint")
                         trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
                         docker cp . "$cid":/app
@@ -45,10 +44,8 @@ pipeline {
                 dir('frontend') {
                     sh '''
                         set -eu
-                        ls -la
-
                         cid=$(docker create -w /app "$NODE_IMAGE" sh -ec \
-                          "npm install --no-package-lock --no-audit --no-fund && npm run lint && npm run build")
+                          "npm ci --no-audit --no-fund && npm run lint && npm run build")
                         trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
                         docker cp . "$cid":/app
@@ -62,16 +59,19 @@ pipeline {
             steps {
                 sh '''
                     set -eu
-                    docker build -t "$BACKEND_IMAGE" ./backend
-                    docker build -t "$FRONTEND_IMAGE" ./frontend
+                    docker build --provenance=false -t "$BACKEND_IMAGE" ./backend
+                    docker build --provenance=false -t "$FRONTEND_IMAGE" ./frontend
 
-                    docker exec blog-project-control-plane \
-                      crictl images >/dev/null
+                    # Check the kind node container is reachable
+                    docker exec "$KIND_NODE" crictl images >/dev/null
 
-                    kind load docker-image "$BACKEND_IMAGE" \
-                      --name blog-project
-                    kind load docker-image "$FRONTEND_IMAGE" \
-                      --name blog-project
+                    # Load images into the kind node (same as "kind load docker-image")
+                    docker save "$BACKEND_IMAGE" | \
+                      docker exec -i "$KIND_NODE" ctr --namespace=k8s.io images import -
+                    docker save "$FRONTEND_IMAGE" | \
+                      docker exec -i "$KIND_NODE" ctr --namespace=k8s.io images import -
+
+                    docker exec "$KIND_NODE" crictl images | grep blogreact
                 '''
             }
         }
@@ -97,6 +97,10 @@ pipeline {
                     kubectl apply -f k8s/backend/service.yaml
                     kubectl apply -f k8s/frontend/deployment.yaml
                     kubectl apply -f k8s/frontend/service.yaml
+
+                    # Restart so pods pick up the freshly loaded :local images
+                    kubectl rollout restart deployment/backend  -n "$APP_NAMESPACE"
+                    kubectl rollout restart deployment/frontend -n "$APP_NAMESPACE"
 
                     kubectl rollout status deployment/backend \
                       -n "$APP_NAMESPACE" --timeout=180s
