@@ -1,3 +1,4 @@
+
 pipeline {
     agent any
 
@@ -5,21 +6,36 @@ pipeline {
         timestamps()
         disableConcurrentBuilds()
         skipDefaultCheckout(true)
-        timeout(time: 30, unit: 'MINUTES')
+        timeout(time: 40, unit: 'MINUTES')
     }
 
     environment {
-        APP_NAMESPACE  = 'blogapp'
-        BACKEND_IMAGE  = 'blogreact-backend:local'
-        FRONTEND_IMAGE = 'blogreact-frontend:local'
-        NODE_IMAGE     = 'node:20-alpine'
-        KIND_NODE      = 'blog-project-control-plane'
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        AWS_REGION         = 'ap-south-1'
+        AWS_ACCOUNT_ID     = '599243103173'
+        EKS_CLUSTER        = 'blogapp-eks-cluster'
+        APP_NAMESPACE      = 'blogapp'
+
+        ECR_REGISTRY       = '599243103173.dkr.ecr.ap-south-1.amazonaws.com'
+        BACKEND_REPO       = '599243103173.dkr.ecr.ap-south-1.amazonaws.com/blogapp-backend'
+        FRONTEND_REPO      = '599243103173.dkr.ecr.ap-south-1.amazonaws.com/blogapp-frontend'
+
+        NODE_IMAGE         = 'node:20-alpine'
+        KUBECTL_PATH       = '/var/jenkins_home/tools/bin'
+        KUBECONFIG         = "${WORKSPACE}/eks-kubeconfig"
     }
 
     stages {
         stage('Checkout') {
             steps {
                 checkout scm
+                script {
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${sh(
+                        returnStdout: true,
+                        script: 'git rev-parse --short=7 HEAD'
+                    ).trim()}"
+                }
+                echo "Image tag for this build: ${IMAGE_TAG}"
             }
         }
 
@@ -28,8 +44,11 @@ pipeline {
                 dir('backend') {
                     sh '''
                         set -eu
+                        set +x
+
                         CID=$(docker create -w /app "$NODE_IMAGE" \
                           sh -ec "npm install --no-package-lock --no-audit --no-fund && npm test && npm run lint")
+
                         trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
 
                         docker cp . "$CID":/app
@@ -44,8 +63,11 @@ pipeline {
                 dir('frontend') {
                     sh '''
                         set -eu
+                        set +x
+
                         CID=$(docker create -w /app "$NODE_IMAGE" \
                           sh -ec "npm install --no-package-lock --no-audit --no-fund && npm run lint && npm run build")
+
                         trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
 
                         docker cp . "$CID":/app
@@ -55,115 +77,176 @@ pipeline {
             }
         }
 
-        stage('Build and Load Images') {
+        stage('Build Docker Images') {
             steps {
                 sh '''
                     set -eu
+                    set +x
 
-                    docker build --provenance=false -t "$BACKEND_IMAGE" ./backend
-                    docker build --provenance=false -t "$FRONTEND_IMAGE" ./frontend
+                    echo "Building backend image..."
+                    docker build --provenance=false \
+                      -t "$BACKEND_REPO:$IMAGE_TAG" ./backend
 
-                    docker exec "$KIND_NODE" crictl images >/dev/null
+                    echo "Building frontend image..."
+                    docker build --provenance=false \
+                      -t "$FRONTEND_REPO:$IMAGE_TAG" ./frontend
 
-                    docker save "$BACKEND_IMAGE" | \
-                      docker exec -i "$KIND_NODE" ctr --namespace=k8s.io images import -
-                    docker save "$FRONTEND_IMAGE" | \
-                      docker exec -i "$KIND_NODE" ctr --namespace=k8s.io images import -
-
-                    docker exec "$KIND_NODE" crictl images | grep blogreact
+                    echo "Built images:"
+                    docker image inspect "$BACKEND_REPO:$IMAGE_TAG" >/dev/null
+                    docker image inspect "$FRONTEND_REPO:$IMAGE_TAG" >/dev/null
                 '''
             }
         }
 
-        stage('Validate Kubernetes Manifests') {
+        stage('Push Images to ECR') {
             steps {
-                sh '''
-                    set -eu
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws-blogapp-jenkins',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
+                        export PATH="$KUBECTL_PATH:$PATH"
 
-                    k() { docker exec -i "$KIND_NODE" kubectl --kubeconfig=/etc/kubernetes/admin.conf "$@"; }
+                        echo "Authenticating Docker with Amazon ECR..."
+                        aws ecr get-login-password --region "$AWS_REGION" |
+                          docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-                    echo "Preflight: kubectl and kubeconfig inside kind node..."
-                    docker exec "$KIND_NODE" test -f /etc/kubernetes/admin.conf \
-                      || { echo "ERROR: /etc/kubernetes/admin.conf missing in $KIND_NODE"; exit 1; }
-                    docker exec "$KIND_NODE" which kubectl >/dev/null \
-                      || { echo "ERROR: kubectl missing in $KIND_NODE"; exit 1; }
+                        echo "Pushing backend image..."
+                        docker push "$BACKEND_REPO:$IMAGE_TAG"
 
-                    echo "Checking Kubernetes connectivity..."
-                    k --request-timeout=15s get namespace "$APP_NAMESPACE"
+                        echo "Pushing frontend image..."
+                        docker push "$FRONTEND_REPO:$IMAGE_TAG"
 
-                    for f in k8s/backend/deployment.yaml k8s/backend/service.yaml \
-                             k8s/frontend/deployment.yaml k8s/frontend/service.yaml; do
-                        echo "Validating $f"
-                        k apply --dry-run=client -f - < "$f"
-                    done
-                '''
+                        docker logout "$ECR_REGISTRY"
+                        echo "Both images pushed successfully."
+                    '''
+                }
             }
         }
 
-        stage('Deploy to Kubernetes') {
+        stage('Configure EKS Access') {
             steps {
-                sh '''
-                    set -eu
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws-blogapp-jenkins',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
+                        export PATH="$KUBECTL_PATH:$PATH"
 
-                    k() { docker exec -i "$KIND_NODE" kubectl --kubeconfig=/etc/kubernetes/admin.conf "$@"; }
+                        echo "Checking AWS identity..."
+                        aws sts get-caller-identity
 
-                    for f in k8s/backend/deployment.yaml k8s/backend/service.yaml \
-                             k8s/frontend/deployment.yaml k8s/frontend/service.yaml; do
-                        echo "Applying $f"
-                        k apply -f - < "$f"
-                    done
+                        echo "Checking EKS cluster..."
+                        aws eks describe-cluster \
+                          --name "$EKS_CLUSTER" \
+                          --region "$AWS_REGION" \
+                          --query 'cluster.status' \
+                          --output text
 
-                    k rollout restart deployment/backend  -n "$APP_NAMESPACE"
-                    k rollout restart deployment/frontend -n "$APP_NAMESPACE"
+                        echo "Generating kubeconfig..."
+                        aws eks update-kubeconfig \
+                          --name "$EKS_CLUSTER" \
+                          --region "$AWS_REGION" \
+                          --kubeconfig "$KUBECONFIG"
 
-                    k rollout status deployment/backend  -n "$APP_NAMESPACE" --timeout=180s
-                    k rollout status deployment/frontend -n "$APP_NAMESPACE" --timeout=180s
-                '''
+                        echo "Checking Kubernetes access..."
+                        kubectl get deployments -n "$APP_NAMESPACE"
+
+                        echo "Checking deployment permission..."
+                        kubectl auth can-i patch deployments \
+                          -n "$APP_NAMESPACE"
+                    '''
+                }
             }
         }
 
-        stage('Smoke Test') {
+        stage('Deploy to EKS') {
             steps {
-                sh '''
-                    set -eu
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws-blogapp-jenkins',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
+                        export PATH="$KUBECTL_PATH:$PATH"
 
-                    k() { docker exec -i "$KIND_NODE" kubectl --kubeconfig=/etc/kubernetes/admin.conf "$@"; }
+                        echo "Updating backend image..."
+                        kubectl set image deployment/backend \
+                          backend="$BACKEND_REPO:$IMAGE_TAG" \
+                          -n "$APP_NAMESPACE"
 
-                    k wait --for=condition=Available deployment/backend  -n "$APP_NAMESPACE" --timeout=120s
-                    k wait --for=condition=Available deployment/frontend -n "$APP_NAMESPACE" --timeout=120s
+                        echo "Updating frontend image..."
+                        kubectl set image deployment/frontend \
+                          frontend="$FRONTEND_REPO:$IMAGE_TAG" \
+                          -n "$APP_NAMESPACE"
+                    '''
+                }
+            }
+        }
 
-                    POD="jenkins-smoke-${BUILD_NUMBER}"
-                    trap 'k delete pod "$POD" -n "$APP_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true' EXIT
+        stage('Verify Deployment') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws-blogapp-jenkins',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
+                        export PATH="$KUBECTL_PATH:$PATH"
 
-                    k run "$POD" -n "$APP_NAMESPACE" \
-                      --image=curlimages/curl:8.12.1 \
-                      --restart=Never \
-                      --command -- \
-                      curl --fail --silent --show-error \
-                      --retry 10 --retry-connrefused --retry-delay 2 \
-                      http://frontend-service/api/healthz
+                        echo "Waiting for backend rollout..."
+                        kubectl rollout status deployment/backend \
+                          -n "$APP_NAMESPACE" --timeout=240s
 
-                    k wait --for=jsonpath='{.status.phase}'=Succeeded \
-                      pod/"$POD" -n "$APP_NAMESPACE" --timeout=120s \
-                      || { k logs "$POD" -n "$APP_NAMESPACE" || true; exit 1; }
+                        echo "Waiting for frontend rollout..."
+                        kubectl rollout status deployment/frontend \
+                          -n "$APP_NAMESPACE" --timeout=240s
 
-                    k logs "$POD" -n "$APP_NAMESPACE"
-                    echo "Smoke test completed successfully."
-                '''
+                        echo "Final deployment status:"
+                        kubectl get deployments -n "$APP_NAMESPACE"
+
+                        echo "Running pods:"
+                        kubectl get pods -n "$APP_NAMESPACE"
+
+                        echo "Services (read-only check):"
+                        kubectl get services -n "$APP_NAMESPACE"
+
+                        echo "Deployment verification completed."
+                    '''
+                }
             }
         }
     }
 
     post {
         success {
-            echo 'Local CI/CD pipeline and smoke test succeeded.'
+            echo "CI/CD succeeded. Deployed image tag: ${IMAGE_TAG}"
         }
+
         failure {
-            echo 'Pipeline failed. Check the first failing stage and its error.'
+            echo 'Pipeline failed. Check the first failing stage in Console Output.'
         }
+
         always {
             echo 'Pipeline finished.'
         }
     }
 }
-
