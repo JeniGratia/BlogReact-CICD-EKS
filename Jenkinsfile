@@ -100,44 +100,30 @@ pipeline {
 
                     test -f "$KUBE_CONFIG"
 
-                    docker run --rm \
-                      --network kind \
-                      -v "$KUBE_CONFIG:/root/.kube/config:ro" \
-                      "$KUBECTL_IMAGE" \
-                      --request-timeout=15s \
+                    kubectl_docker() {
+                        docker run --rm \
+                          --network kind \
+                          -v "$KUBE_CONFIG:/root/.kube/config:ro" \
+                          -e KUBECONFIG=/root/.kube/config \
+                          -v "$WORKSPACE:/workspace:ro" \
+                          -w /workspace \
+                          "$KUBECTL_IMAGE" "$@"
+                    }
+
+                    kubectl_docker --request-timeout=15s \
                       get namespace "$APP_NAMESPACE"
 
-                    docker run --rm \
-                      --network kind \
-                      -v "$KUBE_CONFIG:/root/.kube/config:ro" \
-                      -v "$WORKSPACE:/workspace:ro" \
-                      -w /workspace \
-                      "$KUBECTL_IMAGE" \
-                      apply --dry-run=client -f k8s/backend/deployment.yaml
+                    kubectl_docker apply --dry-run=client \
+                      -f k8s/backend/deployment.yaml
 
-                    docker run --rm \
-                      --network kind \
-                      -v "$KUBE_CONFIG:/root/.kube/config:ro" \
-                      -v "$WORKSPACE:/workspace:ro" \
-                      -w /workspace \
-                      "$KUBECTL_IMAGE" \
-                      apply --dry-run=client -f k8s/backend/service.yaml
+                    kubectl_docker apply --dry-run=client \
+                      -f k8s/backend/service.yaml
 
-                    docker run --rm \
-                      --network kind \
-                      -v "$KUBE_CONFIG:/root/.kube/config:ro" \
-                      -v "$WORKSPACE:/workspace:ro" \
-                      -w /workspace \
-                      "$KUBECTL_IMAGE" \
-                      apply --dry-run=client -f k8s/frontend/deployment.yaml
+                    kubectl_docker apply --dry-run=client \
+                      -f k8s/frontend/deployment.yaml
 
-                    docker run --rm \
-                      --network kind \
-                      -v "$KUBE_CONFIG:/root/.kube/config:ro" \
-                      -v "$WORKSPACE:/workspace:ro" \
-                      -w /workspace \
-                      "$KUBECTL_IMAGE" \
-                      apply --dry-run=client -f k8s/frontend/service.yaml
+                    kubectl_docker apply --dry-run=client \
+                      -f k8s/frontend/service.yaml
                 '''
             }
         }
@@ -148,12 +134,13 @@ pipeline {
                     set -eu
 
                     kubectl_docker() {
-                      docker run --rm \
-                        --network kind \
-                        -v "$KUBE_CONFIG:/root/.kube/config:ro" \
-                        -v "$WORKSPACE:/workspace:ro" \
-                        -w /workspace \
-                        "$KUBECTL_IMAGE" "$@"
+                        docker run --rm \
+                          --network kind \
+                          -v "$KUBE_CONFIG:/root/.kube/config:ro" \
+                          -e KUBECONFIG=/root/.kube/config \
+                          -v "$WORKSPACE:/workspace:ro" \
+                          -w /workspace \
+                          "$KUBECTL_IMAGE" "$@"
                     }
 
                     kubectl_docker apply -f k8s/backend/deployment.yaml
@@ -182,10 +169,11 @@ pipeline {
                     set -eu
 
                     kubectl_docker() {
-                      docker run --rm \
-                        --network kind \
-                        -v "$KUBE_CONFIG:/root/.kube/config:ro" \
-                        "$KUBECTL_IMAGE" "$@"
+                        docker run --rm \
+                          --network kind \
+                          -v "$KUBE_CONFIG:/root/.kube/config:ro" \
+                          -e KUBECONFIG=/root/.kube/config \
+                          "$KUBECTL_IMAGE" "$@"
                     }
 
                     kubectl_docker wait \
