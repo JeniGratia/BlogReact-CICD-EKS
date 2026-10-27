@@ -1,4 +1,3 @@
-
 pipeline {
     agent any
 
@@ -27,12 +26,15 @@ pipeline {
             steps {
                 dir('backend') {
                     sh '''
-                        docker run --rm \
-                          -v "$PWD:/app" -w /app \
-                          "$NODE_IMAGE" sh -ec \
-                          'npm install --no-package-lock --no-audit --no-fund &&
-                           npm test &&
-                           npm run lint'
+                        set -eu
+                        ls -la   # debug: confirm package.json exists in the workspace
+
+                        cid=$(docker create -w /app "$NODE_IMAGE" sh -ec \
+                          "npm install --no-package-lock --no-audit --no-fund && npm test && npm run lint")
+                        trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+
+                        docker cp . "$cid":/app
+                        docker start -a "$cid"
                     '''
                 }
             }
@@ -42,12 +44,15 @@ pipeline {
             steps {
                 dir('frontend') {
                     sh '''
-                        docker run --rm \
-                          -v "$PWD:/app" -w /app \
-                          "$NODE_IMAGE" sh -ec \
-                          'npm install --no-package-lock --no-audit --no-fund &&
-                           npm run lint &&
-                           npm run build'
+                        set -eu
+                        ls -la
+
+                        cid=$(docker create -w /app "$NODE_IMAGE" sh -ec \
+                          "npm install --no-package-lock --no-audit --no-fund && npm run lint && npm run build")
+                        trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+
+                        docker cp . "$cid":/app
+                        docker start -a "$cid"
                     '''
                 }
             }
@@ -75,14 +80,10 @@ pipeline {
             steps {
                 sh '''
                     set -eu
-                    kubectl apply --dry-run=client \
-                      -f k8s/backend/deployment.yaml
-                    kubectl apply --dry-run=client \
-                      -f k8s/backend/service.yaml
-                    kubectl apply --dry-run=client \
-                      -f k8s/frontend/deployment.yaml
-                    kubectl apply --dry-run=client \
-                      -f k8s/frontend/service.yaml
+                    kubectl apply --dry-run=client -f k8s/backend/deployment.yaml
+                    kubectl apply --dry-run=client -f k8s/backend/service.yaml
+                    kubectl apply --dry-run=client -f k8s/frontend/deployment.yaml
+                    kubectl apply --dry-run=client -f k8s/frontend/service.yaml
                 '''
             }
         }
@@ -111,11 +112,9 @@ pipeline {
                     set -eu
 
                     kubectl wait --for=condition=Available \
-                      deployment/backend -n "$APP_NAMESPACE" \
-                      --timeout=120s
+                      deployment/backend -n "$APP_NAMESPACE" --timeout=120s
                     kubectl wait --for=condition=Available \
-                      deployment/frontend -n "$APP_NAMESPACE" \
-                      --timeout=120s
+                      deployment/frontend -n "$APP_NAMESPACE" --timeout=120s
 
                     kubectl run "jenkins-smoke-${BUILD_NUMBER}" \
                       -n "$APP_NAMESPACE" \
@@ -144,3 +143,4 @@ pipeline {
         }
     }
 }
+
