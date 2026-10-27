@@ -20,7 +20,6 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
-                sh 'git status --short'
             }
         }
 
@@ -29,10 +28,11 @@ pipeline {
                 dir('backend') {
                     sh '''
                         docker run --rm \
-                          -v "$PWD:/app" \
-                          -w /app \
-                          "$NODE_IMAGE" sh -lc \
-                          "npm ci && npm test && npm run lint"
+                          -v "$PWD:/app" -w /app \
+                          "$NODE_IMAGE" sh -ec \
+                          'npm install --no-package-lock --no-audit --no-fund &&
+                           npm test &&
+                           npm run lint'
                     '''
                 }
             }
@@ -43,20 +43,25 @@ pipeline {
                 dir('frontend') {
                     sh '''
                         docker run --rm \
-                          -v "$PWD:/app" \
-                          -w /app \
-                          "$NODE_IMAGE" sh -lc \
-                          "npm ci && npm run lint && npm run build"
+                          -v "$PWD:/app" -w /app \
+                          "$NODE_IMAGE" sh -ec \
+                          'npm install --no-package-lock --no-audit --no-fund &&
+                           npm run lint &&
+                           npm run build'
                     '''
                 }
             }
         }
 
-        stage('Build Docker Images') {
+        stage('Build Images') {
             steps {
                 sh '''
+                    set -eu
                     docker build -t "$BACKEND_IMAGE" ./backend
                     docker build -t "$FRONTEND_IMAGE" ./frontend
+
+                    docker exec blog-project-control-plane \
+                      crictl images >/dev/null
 
                     kind load docker-image "$BACKEND_IMAGE" \
                       --name blog-project
@@ -66,9 +71,10 @@ pipeline {
             }
         }
 
-        stage('Validate Kubernetes Manifests') {
+        stage('Validate Manifests') {
             steps {
                 sh '''
+                    set -eu
                     kubectl apply --dry-run=client \
                       -f k8s/backend/deployment.yaml
                     kubectl apply --dry-run=client \
@@ -81,7 +87,7 @@ pipeline {
             }
         }
 
-        stage('Deploy to Local Kubernetes') {
+        stage('Deploy') {
             steps {
                 sh '''
                     set -eu
@@ -99,7 +105,7 @@ pipeline {
             }
         }
 
-        stage('Automated Deployment Validation') {
+        stage('Smoke Test') {
             steps {
                 sh '''
                     set -eu
@@ -121,8 +127,6 @@ pipeline {
                       --retry 10 --retry-connrefused \
                       --retry-delay 2 \
                       http://frontend-service/api/healthz
-
-                    echo "Deployment validation passed."
                 '''
             }
         }
@@ -130,13 +134,13 @@ pipeline {
 
     post {
         success {
-            echo 'CI pipeline and deployment validation succeeded.'
+            echo 'Local CI/CD pipeline and smoke test succeeded.'
         }
         failure {
-            echo 'Pipeline failed. Review the first failing stage.'
+            echo 'Pipeline failed. Check the first failing stage.'
         }
         always {
-            echo 'Pipeline execution finished.'
+            echo 'Pipeline finished.'
         }
     }
 }
