@@ -6,7 +6,7 @@ pipeline {
         timestamps()
         disableConcurrentBuilds()
         skipDefaultCheckout(true)
-        timeout(time: 40, unit: 'MINUTES')
+        timeout(time: 50, unit: 'MINUTES')
     }
 
     environment {
@@ -49,6 +49,8 @@ pipeline {
                         set -eu
                         set +x
 
+                        rm -rf coverage
+
                         CID=$(docker create -w /app "$NODE_IMAGE" \
                           sh -ec "npm install --no-package-lock --no-audit --no-fund && npm test && npm run lint")
 
@@ -56,6 +58,11 @@ pipeline {
 
                         docker cp . "$CID":/app
                         docker start -a "$CID"
+
+                        docker cp "$CID":/app/coverage ./coverage
+                        test -s coverage/lcov.info
+
+                        echo "Backend tests, lint and coverage report completed."
                     '''
                 }
             }
@@ -75,7 +82,46 @@ pipeline {
 
                         docker cp . "$CID":/app
                         docker start -a "$CID"
+
+                        echo "Frontend lint and build completed."
                     '''
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    def scannerHome = tool 'SonarScanner'
+
+                    withSonarQubeEnv('SonarQube') {
+                        sh """
+                            set -eu
+                            set +x
+
+                            test -s backend/coverage/lcov.info
+                            test -f sonar-project.properties
+
+                            "${scannerHome}/bin/sonar-scanner" \
+                              -Dsonar.project.settings=sonar-project.properties
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    script {
+                        def qualityGate = waitForQualityGate()
+
+                        echo "SonarQube Quality Gate: ${qualityGate.status}"
+
+                        if (qualityGate.status != 'OK') {
+                            error "SonarQube Quality Gate failed: ${qualityGate.status}. Deployment blocked."
+                        }
+                    }
                 }
             }
         }
@@ -259,8 +305,8 @@ pipeline {
         }
 
         always {
+            sh 'rm -f "$KUBECONFIG" || true'
             echo 'Pipeline finished.'
         }
     }
 }
-
