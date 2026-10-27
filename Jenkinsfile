@@ -13,9 +13,7 @@ pipeline {
         BACKEND_IMAGE  = 'blogreact-backend:local'
         FRONTEND_IMAGE = 'blogreact-frontend:local'
         NODE_IMAGE     = 'node:20-alpine'
-        KUBECTL_IMAGE  = 'bitnami/kubectl:latest'
         KIND_NODE      = 'blog-project-control-plane'
-        KUBE_CONFIG    = '/home/user/projects/BlogReact/jenkins-kubeconfig'
     }
 
     stages {
@@ -30,12 +28,8 @@ pipeline {
                 dir('backend') {
                     sh '''
                         set -eu
-
-                        CID=$(docker create \
-                            -w /app \
-                            "$NODE_IMAGE" \
-                            sh -ec "npm install --no-package-lock --no-audit --no-fund && npm test && npm run lint")
-
+                        CID=$(docker create -w /app "$NODE_IMAGE" \
+                          sh -ec "npm install --no-package-lock --no-audit --no-fund && npm test && npm run lint")
                         trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
 
                         docker cp . "$CID":/app
@@ -50,12 +44,8 @@ pipeline {
                 dir('frontend') {
                     sh '''
                         set -eu
-
-                        CID=$(docker create \
-                            -w /app \
-                            "$NODE_IMAGE" \
-                            sh -ec "npm install --no-package-lock --no-audit --no-fund && npm run lint && npm run build")
-
+                        CID=$(docker create -w /app "$NODE_IMAGE" \
+                          sh -ec "npm install --no-package-lock --no-audit --no-fund && npm run lint && npm run build")
                         trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
 
                         docker cp . "$CID":/app
@@ -70,30 +60,17 @@ pipeline {
                 sh '''
                     set -eu
 
-                    echo "Building backend image..."
-                    docker build --provenance=false \
-                        -t "$BACKEND_IMAGE" ./backend
+                    docker build --provenance=false -t "$BACKEND_IMAGE" ./backend
+                    docker build --provenance=false -t "$FRONTEND_IMAGE" ./frontend
 
-                    echo "Building frontend image..."
-                    docker build --provenance=false \
-                        -t "$FRONTEND_IMAGE" ./frontend
-
-                    echo "Checking kind node..."
                     docker exec "$KIND_NODE" crictl images >/dev/null
 
-                    echo "Loading backend image into kind..."
-                    docker save "$BACKEND_IMAGE" |
-                        docker exec -i "$KIND_NODE" \
-                        ctr --namespace=k8s.io images import -
+                    docker save "$BACKEND_IMAGE" | \
+                      docker exec -i "$KIND_NODE" ctr --namespace=k8s.io images import -
+                    docker save "$FRONTEND_IMAGE" | \
+                      docker exec -i "$KIND_NODE" ctr --namespace=k8s.io images import -
 
-                    echo "Loading frontend image into kind..."
-                    docker save "$FRONTEND_IMAGE" |
-                        docker exec -i "$KIND_NODE" \
-                        ctr --namespace=k8s.io images import -
-
-                    echo "Verifying imported images..."
-                    docker exec "$KIND_NODE" crictl images |
-                        grep blogreact
+                    docker exec "$KIND_NODE" crictl images | grep blogreact
                 '''
             }
         }
@@ -103,46 +80,22 @@ pipeline {
                 sh '''
                     set -eu
 
-                    echo "Checking kubeconfig file..."
-                    test -f "$KUBE_CONFIG" || {
-                        echo "ERROR: Kubeconfig file not found: $KUBE_CONFIG"
-                        exit 1
-                    }
+                    k() { docker exec -i "$KIND_NODE" kubectl --kubeconfig=/etc/kubernetes/admin.conf "$@"; }
 
-                    kubectl_docker() {
-                        docker run --rm \
-                            --network kind \
-                            -v "$KUBE_CONFIG:/root/.kube/config:ro" \
-                            -e KUBECONFIG=/root/.kube/config \
-                            -v "$WORKSPACE:/workspace:ro" \
-                            -w /workspace \
-                            "$KUBECTL_IMAGE" "$@"
-                    }
+                    echo "Preflight: kubectl and kubeconfig inside kind node..."
+                    docker exec "$KIND_NODE" test -f /etc/kubernetes/admin.conf \
+                      || { echo "ERROR: /etc/kubernetes/admin.conf missing in $KIND_NODE"; exit 1; }
+                    docker exec "$KIND_NODE" which kubectl >/dev/null \
+                      || { echo "ERROR: kubectl missing in $KIND_NODE"; exit 1; }
 
                     echo "Checking Kubernetes connectivity..."
-                    kubectl_docker \
-                        --request-timeout=15s \
-                        get namespace "$APP_NAMESPACE"
+                    k --request-timeout=15s get namespace "$APP_NAMESPACE"
 
-                    echo "Validating backend deployment..."
-                    kubectl_docker apply \
-                        --dry-run=client \
-                        -f k8s/backend/deployment.yaml
-
-                    echo "Validating backend service..."
-                    kubectl_docker apply \
-                        --dry-run=client \
-                        -f k8s/backend/service.yaml
-
-                    echo "Validating frontend deployment..."
-                    kubectl_docker apply \
-                        --dry-run=client \
-                        -f k8s/frontend/deployment.yaml
-
-                    echo "Validating frontend service..."
-                    kubectl_docker apply \
-                        --dry-run=client \
-                        -f k8s/frontend/service.yaml
+                    for f in k8s/backend/deployment.yaml k8s/backend/service.yaml \
+                             k8s/frontend/deployment.yaml k8s/frontend/service.yaml; do
+                        echo "Validating $f"
+                        k apply --dry-run=client -f - < "$f"
+                    done
                 '''
             }
         }
@@ -152,43 +105,19 @@ pipeline {
                 sh '''
                     set -eu
 
-                    kubectl_docker() {
-                        docker run --rm \
-                            --network kind \
-                            -v "$KUBE_CONFIG:/root/.kube/config:ro" \
-                            -e KUBECONFIG=/root/.kube/config \
-                            -v "$WORKSPACE:/workspace:ro" \
-                            -w /workspace \
-                            "$KUBECTL_IMAGE" "$@"
-                    }
+                    k() { docker exec -i "$KIND_NODE" kubectl --kubeconfig=/etc/kubernetes/admin.conf "$@"; }
 
-                    echo "Applying backend deployment..."
-                    kubectl_docker apply \
-                        -f k8s/backend/deployment.yaml
+                    for f in k8s/backend/deployment.yaml k8s/backend/service.yaml \
+                             k8s/frontend/deployment.yaml k8s/frontend/service.yaml; do
+                        echo "Applying $f"
+                        k apply -f - < "$f"
+                    done
 
-                    echo "Applying backend service..."
-                    kubectl_docker apply \
-                        -f k8s/backend/service.yaml
+                    k rollout restart deployment/backend  -n "$APP_NAMESPACE"
+                    k rollout restart deployment/frontend -n "$APP_NAMESPACE"
 
-                    echo "Applying frontend deployment..."
-                    kubectl_docker apply \
-                        -f k8s/frontend/deployment.yaml
-
-                    echo "Applying frontend service..."
-                    kubectl_docker apply \
-                        -f k8s/frontend/service.yaml
-
-                    echo "Waiting for backend rollout..."
-                    kubectl_docker rollout status \
-                        deployment/backend \
-                        -n "$APP_NAMESPACE" \
-                        --timeout=180s
-
-                    echo "Waiting for frontend rollout..."
-                    kubectl_docker rollout status \
-                        deployment/frontend \
-                        -n "$APP_NAMESPACE" \
-                        --timeout=180s
+                    k rollout status deployment/backend  -n "$APP_NAMESPACE" --timeout=180s
+                    k rollout status deployment/frontend -n "$APP_NAMESPACE" --timeout=180s
                 '''
             }
         }
@@ -198,43 +127,27 @@ pipeline {
                 sh '''
                     set -eu
 
-                    kubectl_docker() {
-                        docker run --rm \
-                            --network kind \
-                            -v "$KUBE_CONFIG:/root/.kube/config:ro" \
-                            -e KUBECONFIG=/root/.kube/config \
-                            "$KUBECTL_IMAGE" "$@"
-                    }
+                    k() { docker exec -i "$KIND_NODE" kubectl --kubeconfig=/etc/kubernetes/admin.conf "$@"; }
 
-                    echo "Checking backend availability..."
-                    kubectl_docker wait \
-                        --for=condition=Available \
-                        deployment/backend \
-                        -n "$APP_NAMESPACE" \
-                        --timeout=120s
+                    k wait --for=condition=Available deployment/backend  -n "$APP_NAMESPACE" --timeout=120s
+                    k wait --for=condition=Available deployment/frontend -n "$APP_NAMESPACE" --timeout=120s
 
-                    echo "Checking frontend availability..."
-                    kubectl_docker wait \
-                        --for=condition=Available \
-                        deployment/frontend \
-                        -n "$APP_NAMESPACE" \
-                        --timeout=120s
+                    POD="jenkins-smoke-${BUILD_NUMBER}"
+                    trap 'k delete pod "$POD" -n "$APP_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true' EXIT
 
-                    echo "Running application health check..."
-                    kubectl_docker run \
-                        "jenkins-smoke-${BUILD_NUMBER}" \
-                        -n "$APP_NAMESPACE" \
-                        --image=curlimages/curl:8.12.1 \
-                        --restart=Never \
-                        --rm -i \
-                        --quiet \
-                        --command -- \
-                        curl --fail --silent --show-error \
-                        --retry 10 \
-                        --retry-connrefused \
-                        --retry-delay 2 \
-                        http://frontend-service/api/healthz
+                    k run "$POD" -n "$APP_NAMESPACE" \
+                      --image=curlimages/curl:8.12.1 \
+                      --restart=Never \
+                      --command -- \
+                      curl --fail --silent --show-error \
+                      --retry 10 --retry-connrefused --retry-delay 2 \
+                      http://frontend-service/api/healthz
 
+                    k wait --for=jsonpath='{.status.phase}'=Succeeded \
+                      pod/"$POD" -n "$APP_NAMESPACE" --timeout=120s \
+                      || { k logs "$POD" -n "$APP_NAMESPACE" || true; exit 1; }
+
+                    k logs "$POD" -n "$APP_NAMESPACE"
                     echo "Smoke test completed successfully."
                 '''
             }
@@ -245,11 +158,9 @@ pipeline {
         success {
             echo 'Local CI/CD pipeline and smoke test succeeded.'
         }
-
         failure {
             echo 'Pipeline failed. Check the first failing stage and its error.'
         }
-
         always {
             echo 'Pipeline finished.'
         }
