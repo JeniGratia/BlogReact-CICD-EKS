@@ -1,3 +1,4 @@
+
 pipeline {
     agent any
 
@@ -13,7 +14,9 @@ pipeline {
         BACKEND_IMAGE  = 'blogreact-backend:local'
         FRONTEND_IMAGE = 'blogreact-frontend:local'
         NODE_IMAGE     = 'node:20-alpine'
+        KUBECTL_IMAGE  = 'bitnami/kubectl:latest'
         KIND_NODE      = 'blog-project-control-plane'
+        KUBE_CONFIG    = '/var/jenkins_home/.kube/config'
     }
 
     stages {
@@ -28,12 +31,16 @@ pipeline {
                 dir('backend') {
                     sh '''
                         set -eu
-                        cid=$(docker create -w /app "$NODE_IMAGE" sh -ec \
-                          "npm ci --no-audit --no-fund && npm test && npm run lint")
-                        trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
-                        docker cp . "$cid":/app
-                        docker start -a "$cid"
+                        CID=$(docker create \
+                          -w /app \
+                          "$NODE_IMAGE" \
+                          sh -ec "npm install --no-package-lock --no-audit --no-fund && npm test && npm run lint")
+
+                        trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+
+                        docker cp . "$CID":/app
+                        docker start -a "$CID"
                     '''
                 }
             }
@@ -44,67 +51,126 @@ pipeline {
                 dir('frontend') {
                     sh '''
                         set -eu
-                        cid=$(docker create -w /app "$NODE_IMAGE" sh -ec \
-                          "npm ci --no-audit --no-fund && npm run lint && npm run build")
-                        trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
-                        docker cp . "$cid":/app
-                        docker start -a "$cid"
+                        CID=$(docker create \
+                          -w /app \
+                          "$NODE_IMAGE" \
+                          sh -ec "npm install --no-package-lock --no-audit --no-fund && npm run lint && npm run build")
+
+                        trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+
+                        docker cp . "$CID":/app
+                        docker start -a "$CID"
                     '''
                 }
             }
         }
 
-        stage('Build Images') {
+        stage('Build and Load Images') {
             steps {
                 sh '''
                     set -eu
-                    docker build --provenance=false -t "$BACKEND_IMAGE" ./backend
-                    docker build --provenance=false -t "$FRONTEND_IMAGE" ./frontend
 
-                    # Check the kind node container is reachable
+                    docker build --provenance=false \
+                      -t "$BACKEND_IMAGE" ./backend
+
+                    docker build --provenance=false \
+                      -t "$FRONTEND_IMAGE" ./frontend
+
                     docker exec "$KIND_NODE" crictl images >/dev/null
 
-                    # Load images into the kind node (same as "kind load docker-image")
-                    docker save "$BACKEND_IMAGE" | \
-                      docker exec -i "$KIND_NODE" ctr --namespace=k8s.io images import -
-                    docker save "$FRONTEND_IMAGE" | \
-                      docker exec -i "$KIND_NODE" ctr --namespace=k8s.io images import -
+                    docker save "$BACKEND_IMAGE" |
+                      docker exec -i "$KIND_NODE" \
+                      ctr --namespace=k8s.io images import -
 
-                    docker exec "$KIND_NODE" crictl images | grep blogreact
+                    docker save "$FRONTEND_IMAGE" |
+                      docker exec -i "$KIND_NODE" \
+                      ctr --namespace=k8s.io images import -
+
+                    docker exec "$KIND_NODE" crictl images |
+                      grep blogreact
                 '''
             }
         }
 
-        stage('Validate Manifests') {
+        stage('Validate Kubernetes Manifests') {
             steps {
                 sh '''
                     set -eu
-                    kubectl apply --dry-run=client -f k8s/backend/deployment.yaml
-                    kubectl apply --dry-run=client -f k8s/backend/service.yaml
-                    kubectl apply --dry-run=client -f k8s/frontend/deployment.yaml
-                    kubectl apply --dry-run=client -f k8s/frontend/service.yaml
+
+                    test -f "$KUBE_CONFIG"
+
+                    docker run --rm \
+                      --network kind \
+                      -v "$KUBE_CONFIG:/root/.kube/config:ro" \
+                      "$KUBECTL_IMAGE" \
+                      --request-timeout=15s \
+                      get namespace "$APP_NAMESPACE"
+
+                    docker run --rm \
+                      --network kind \
+                      -v "$KUBE_CONFIG:/root/.kube/config:ro" \
+                      -v "$WORKSPACE:/workspace:ro" \
+                      -w /workspace \
+                      "$KUBECTL_IMAGE" \
+                      apply --dry-run=client -f k8s/backend/deployment.yaml
+
+                    docker run --rm \
+                      --network kind \
+                      -v "$KUBE_CONFIG:/root/.kube/config:ro" \
+                      -v "$WORKSPACE:/workspace:ro" \
+                      -w /workspace \
+                      "$KUBECTL_IMAGE" \
+                      apply --dry-run=client -f k8s/backend/service.yaml
+
+                    docker run --rm \
+                      --network kind \
+                      -v "$KUBE_CONFIG:/root/.kube/config:ro" \
+                      -v "$WORKSPACE:/workspace:ro" \
+                      -w /workspace \
+                      "$KUBECTL_IMAGE" \
+                      apply --dry-run=client -f k8s/frontend/deployment.yaml
+
+                    docker run --rm \
+                      --network kind \
+                      -v "$KUBE_CONFIG:/root/.kube/config:ro" \
+                      -v "$WORKSPACE:/workspace:ro" \
+                      -w /workspace \
+                      "$KUBECTL_IMAGE" \
+                      apply --dry-run=client -f k8s/frontend/service.yaml
                 '''
             }
         }
 
-        stage('Deploy') {
+        stage('Deploy to Kubernetes') {
             steps {
                 sh '''
                     set -eu
 
-                    kubectl apply -f k8s/backend/deployment.yaml
-                    kubectl apply -f k8s/backend/service.yaml
-                    kubectl apply -f k8s/frontend/deployment.yaml
-                    kubectl apply -f k8s/frontend/service.yaml
+                    kubectl_docker() {
+                      docker run --rm \
+                        --network kind \
+                        -v "$KUBE_CONFIG:/root/.kube/config:ro" \
+                        -v "$WORKSPACE:/workspace:ro" \
+                        -w /workspace \
+                        "$KUBECTL_IMAGE" "$@"
+                    }
 
-                    # Restart so pods pick up the freshly loaded :local images
-                    kubectl rollout restart deployment/backend  -n "$APP_NAMESPACE"
-                    kubectl rollout restart deployment/frontend -n "$APP_NAMESPACE"
+                    kubectl_docker apply -f k8s/backend/deployment.yaml
+                    kubectl_docker apply -f k8s/backend/service.yaml
+                    kubectl_docker apply -f k8s/frontend/deployment.yaml
+                    kubectl_docker apply -f k8s/frontend/service.yaml
 
-                    kubectl rollout status deployment/backend \
+                    kubectl_docker rollout restart deployment/backend \
+                      -n "$APP_NAMESPACE"
+
+                    kubectl_docker rollout restart deployment/frontend \
+                      -n "$APP_NAMESPACE"
+
+                    kubectl_docker rollout status deployment/backend \
                       -n "$APP_NAMESPACE" --timeout=180s
-                    kubectl rollout status deployment/frontend \
+
+                    kubectl_docker rollout status deployment/frontend \
                       -n "$APP_NAMESPACE" --timeout=180s
                 '''
             }
@@ -115,19 +181,31 @@ pipeline {
                 sh '''
                     set -eu
 
-                    kubectl wait --for=condition=Available \
-                      deployment/backend -n "$APP_NAMESPACE" --timeout=120s
-                    kubectl wait --for=condition=Available \
-                      deployment/frontend -n "$APP_NAMESPACE" --timeout=120s
+                    kubectl_docker() {
+                      docker run --rm \
+                        --network kind \
+                        -v "$KUBE_CONFIG:/root/.kube/config:ro" \
+                        "$KUBECTL_IMAGE" "$@"
+                    }
 
-                    kubectl run "jenkins-smoke-${BUILD_NUMBER}" \
+                    kubectl_docker wait \
+                      --for=condition=Available deployment/backend \
+                      -n "$APP_NAMESPACE" --timeout=120s
+
+                    kubectl_docker wait \
+                      --for=condition=Available deployment/frontend \
+                      -n "$APP_NAMESPACE" --timeout=120s
+
+                    kubectl_docker run \
+                      "jenkins-smoke-${BUILD_NUMBER}" \
                       -n "$APP_NAMESPACE" \
                       --image=curlimages/curl:8.12.1 \
                       --restart=Never \
                       --rm -i --quiet \
                       --command -- \
                       curl --fail --silent --show-error \
-                      --retry 10 --retry-connrefused \
+                      --retry 10 \
+                      --retry-connrefused \
                       --retry-delay 2 \
                       http://frontend-service/api/healthz
                 '''
@@ -139,12 +217,13 @@ pipeline {
         success {
             echo 'Local CI/CD pipeline and smoke test succeeded.'
         }
+
         failure {
-            echo 'Pipeline failed. Check the first failing stage.'
+            echo 'Pipeline failed. Check the first failing stage and its error.'
         }
+
         always {
             echo 'Pipeline finished.'
         }
     }
 }
-
