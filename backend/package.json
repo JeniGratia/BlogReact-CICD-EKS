@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "test": "jest --coverage --passWithNoTests",
+    "test": "jest --coverage",
     "lint": "eslint src --ext .js"
   },
   "dependencies": {

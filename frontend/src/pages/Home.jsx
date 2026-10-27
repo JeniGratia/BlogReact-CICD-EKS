@@ -11,12 +11,26 @@ export default function Home() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    setLoading(true);
+    let cancelled = false;
+
     api
       .listPosts(tag === 'all' ? {} : { tag })
-      .then((res) => setPosts(res.data))
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
+      .then((data) => {
+        if (!cancelled) {
+          setPosts(data.data ?? data);
+          setError('');
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err.message || 'Unable to load posts.');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [tag]);
 
   return (

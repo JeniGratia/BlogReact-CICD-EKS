@@ -11,6 +11,20 @@ server {
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
+    location = /api/healthz {
+        proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT}/healthz;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location = /api/readyz {
+        proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT}/readyz;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
     location /api/ {
         proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT}/api/;
         proxy_set_header Host $host;

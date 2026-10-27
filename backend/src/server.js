@@ -11,6 +11,11 @@ const authRoutes = require('./routes/auth');
 const postRoutes = require('./routes/posts');
 
 const app = express();
+
+// Trust the single reverse-proxy hop used by the local Nginx setup.
+// Review this setting if the production ingress/proxy topology changes.
+app.set('trust proxy', 1);
+
 const PORT = process.env.PORT || 5000;
 
 // --- Prometheus metrics ---
@@ -71,8 +76,10 @@ app.use((err, _req, res, _next) => {
 
 app.use((_req, res) => res.status(404).json({ error: 'Route not found' }));
 
-app.listen(PORT, () => {
-  console.log(`Blog API listening on port ${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Blog API listening on port ${PORT}`);
+  });
+}
 
 module.exports = app;

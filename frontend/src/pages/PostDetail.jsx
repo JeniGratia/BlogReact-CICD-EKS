@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import ReadingSpine from '../components/ReadingSpine';
 import { api } from '../api/client';
@@ -12,11 +12,38 @@ export default function PostDetail() {
   const [comment, setComment] = useState('');
   const [posting, setPosting] = useState(false);
 
-  const load = () => api.getPost(slug).then(setPost).catch((err) => setError(err.message));
+  const load = useCallback(async () => {
+    try {
+      const result = await api.getPost(slug);
+      setPost(result);
+      setError('');
+    } catch (err) {
+      setError(err.message || 'Unable to load this post.');
+    }
+  }, [slug]);
 
   useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    let cancelled = false;
+
+    async function fetchPost() {
+      try {
+        const result = await api.getPost(slug);
+        if (!cancelled) {
+          setPost(result);
+          setError('');
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err.message || 'Unable to load this post.');
+        }
+      }
+    }
+
+    fetchPost();
+
+    return () => {
+      cancelled = true;
+    };
   }, [slug]);
 
   const submitComment = async (e) => {
